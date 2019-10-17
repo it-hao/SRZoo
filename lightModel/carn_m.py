@@ -8,7 +8,7 @@ import math
 '''
 
 def make_model(args, parent=False):
-    return CARN(args)
+    return E_CARN(args)
 
 class MeanShift(nn.Conv2d):
     def __init__(self, rgb_mean, rgb_std, sign=-1):
@@ -21,15 +21,15 @@ class MeanShift(nn.Conv2d):
         self.requires_grad = False
 
 class Upsampler(nn.Sequential):
-    def __init__(self, scale, n_feats, act):
+    def __init__(self, scale, n_feats, act, group):
         m = []
         if (scale & (scale - 1)) == 0:
             for _ in range(int(math.log(scale, 2))):
-                m.append(nn.Conv2d(n_feats, 4 * n_feats, 3, padding=1))
+                m.append(nn.Conv2d(n_feats, 4 * n_feats, 3, padding=1, groups=group))
                 m.append(nn.PixelShuffle(2))
                 if act: m.append(nn.ReLU(True))
         elif scale == 3:
-            m.append(nn.Conv2d(n_feats, 9 * n_feats, 3, padding=1))
+            m.append(nn.Conv2d(n_feats, 9 * n_feats, 3, padding=1, groups=group))
             m.append(nn.PixelShuffle(3))
             if act is not None: m.append(act)
         else:
@@ -37,26 +37,27 @@ class Upsampler(nn.Sequential):
 
         super(Upsampler, self).__init__(*m)
 
-# ResNet
-class Residual_block(nn.Module):
-    def __init__(self, n_feats, kernel_size, act):
-        super(Residual_block, self).__init__()
-        self.conv1 = nn.Conv2d(n_feats, n_feats, kernel_size, 1, kernel_size//2)
-        self.conv2 = nn.Conv2d(n_feats, n_feats, kernel_size, 1, kernel_size//2)
+# Effective ResidualBlock
+class EResidual_block(nn.Module):
+    def __init__(self, n_feats, kernel_size, act, group):
+        super(EResidual_block, self).__init__()
+        self.conv1 = nn.Conv2d(n_feats, n_feats, kernel_size, 1, kernel_size//2, groups=group)
+        self.conv2 = nn.Conv2d(n_feats, n_feats, kernel_size, 1, kernel_size//2, groups=group)
+        self.conv3 = nn.Conv2d(n_feats, n_feats, 1, 1, 0)
+
         self.act = act
 
     def forward(self, x):
         out = self.act(self.conv1(x))
-        out = self.act(self.conv2(out) + x)
+        out = self.act(self.conv2(out))
+        out = self.act(self.conv3(out) + x)
         return out
 
 # Cascade Residual Block
-class CRB(nn.Module):
-    def __init__(self, n_feats, kernel_size, act):
-        super(CRB, self).__init__()
-        self.b1 = Residual_block(n_feats, kernel_size, act)
-        self.b2 = Residual_block(n_feats, kernel_size, act)
-        self.b3 = Residual_block(n_feats, kernel_size, act)
+class CARB(nn.Module):
+    def __init__(self, n_feats, kernel_size, act, group):
+        super(CARB, self).__init__()
+        self.b = EResidual_block(n_feats, kernel_size, act, group)
 
         self.c1 = nn.Conv2d(n_feats * 2, n_feats, 1, 1, 0)
         self.c2 = nn.Conv2d(n_feats * 3, n_feats, 1, 1, 0)
@@ -64,28 +65,29 @@ class CRB(nn.Module):
         self.act =act
 
     def forward(self, x):
-        b1 = self.b1(x)
+        b1 = self.b(x)
         c1 = torch.cat([x, b1], dim = 1)
         o1 = self.act(self.c1(c1))
 
-        b2 = self.b2(o1)
+        b2 = self.b(o1)
         c2 = torch.cat([c1, b2], dim = 1)
         o2 = self.act(self.c2(c2))
 
-        b3 = self.b3(o2)
+        b3 = self.b(o2)
         c3 = torch.cat([c2, b3], dim = 1)
         o3 = self.act(self.c3(c3))
 
         return o3
 
-class CARN(nn.Module):
+class E_CARN(nn.Module):
     def __init__(self):
-        super(CARN, self).__init__()
+        super(E_CARN, self).__init__()
 
         n_colors = 3
         n_feats = 64
         kernel_size = 3
         scale = 4
+        group = 4
         self.act = act = nn.ReLU(True)
 
         # RGB mean for DIV2K
@@ -98,9 +100,9 @@ class CARN(nn.Module):
         self.head = nn.Conv2d(n_colors, n_feats, kernel_size, padding=kernel_size // 2)
 
         # middle feature extraction layer
-        self.b1 = CRB(n_feats, kernel_size, act)
-        self.b2 = CRB(n_feats, kernel_size, act)
-        self.b3 = CRB(n_feats, kernel_size, act)
+        self.b1 = CARB(n_feats, kernel_size, act, group)
+        self.b2 = CARB(n_feats, kernel_size, act, group)
+        self.b3 = CARB(n_feats, kernel_size, act, group)
 
         self.c1 = nn.Conv2d(n_feats * 2, n_feats, 1, 1, 0)
         self.c2 = nn.Conv2d(n_feats * 3, n_feats, 1, 1, 0)
@@ -108,7 +110,7 @@ class CARN(nn.Module):
 
         # upsample and reconstruction layer
         self.tail = nn.Sequential(*[
-            Upsampler(scale, n_feats, act=None),
+            Upsampler(scale, n_feats, act=None, group=group),
             nn.Conv2d(n_feats, n_colors, kernel_size=3, padding=kernel_size // 2)
         ])
 
@@ -133,5 +135,5 @@ class CARN(nn.Module):
         return x
 
 from torchstat import stat
-net = CARN()
+net = E_CARN()
 stat(net, (3, 10, 10))
